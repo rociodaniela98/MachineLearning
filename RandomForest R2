@@ -1,0 +1,210 @@
+import numpy as np
+import pandas as pd
+import joblib
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split, RandomizedSearchCV
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import r2_score, mean_squared_error
+from scipy.stats import randint
+from astropy.io import fits
+from astropy.wcs import WCS
+import warnings
+from astropy.wcs import FITSFixedWarning
+from scipy.signal import savgol_filter # Para suavizado
+
+# Silenciar warnings de WCS
+warnings.simplefilter('ignore', category=FITSFixedWarning)
+
+# --- 1. Carga de Datos ---
+cubo_hdu = fits.open("13co32cubo.fits")[0]
+mapa_tex_data = fits.open("mapaTex.fits")[0].data
+mapa_nc_hdu = fits.open("mapaN13.fits")[0] # Mapa de densidad de columna "verdadera" para el entrenamiento
+
+# --- 2. Inicializar WCS y Dimensiones ---
+wcs_cubo = WCS(cubo_hdu.header)
+wcs_mapa = WCS(mapa_nc_hdu.header)
+
+dim_z, dim_y, dim_x = cubo_hdu.data.shape
+cubo_procesado = np.transpose(cubo_hdu.data, (1, 2, 0))
+
+print(f"Forma procesada del cubo: {cubo_procesado.shape}")
+
+# --- 3. Recorte Central y Sincronización de Dimensiones ---
+x_center = dim_x // 2
+y_center = dim_y // 2
+ra_center, dec_center, _ = wcs_cubo.all_pix2world(x_center, y_center, 0, 0)
+x_pix_mapa, y_pix_mapa, _ = wcs_mapa.all_world2pix(ra_center, dec_center, 0, 0)
+
+x_pix_mapa = int(np.round(x_pix_mapa))
+y_pix_mapa = int(np.round(y_pix_mapa))
+
+start_x = max(0, x_pix_mapa - (dim_x // 2))
+end_x   = min(mapa_tex_data.shape[1], start_x + dim_x)
+start_y = max(0, y_pix_mapa - (dim_y // 2))
+end_y   = min(mapa_tex_data.shape[0], start_y + dim_y)
+
+tex_crop = mapa_tex_data[start_y:end_y, start_x:end_x]
+N13CO_crop_true = mapa_nc_hdu.data[start_y:end_y, start_x:end_x]
+cubo_crop = cubo_procesado[0:(end_y - start_y), 0:(end_x - start_x), :]
+
+if not (tex_crop.shape == N13CO_crop_true.shape == cubo_crop.shape[:2]):
+    print(f"Dimensiones de tex_crop: {tex_crop.shape}")
+    print(f"Dimensiones de N13CO_crop_true: {N13CO_crop_true.shape}")
+    print(f"Dimensiones espaciales de cubo_crop: {cubo_crop.shape[:2]}")
+    raise ValueError("Las dimensiones espaciales de los datos recortados NO COINCIDEN. Por favor, revisa tus archivos FITS y los límites de recorte.")
+
+print(f"Dimensiones de los mapas recortados (Y, X): {tex_crop.shape}")
+print(f"Dimensiones del cubo recortado (Y, X, Z): {cubo_crop.shape}")
+
+
+# --- NUEVA MEJORA: Suavizado Ligero del Espectro ---
+# Aplicar un filtro Savitzky-Golay a cada espectro
+# window_length debe ser impar y menor que dim_z
+# polyorder debe ser menor que window_length
+# Ajusta estos valores según el ruido de tus espectros
+window_length = 7 # Por ejemplo, 7 canales. Puedes probar con 5 o 9.
+polyorder = 2   # Grado polinomial. Suele ser 1, 2 o 3.
+
+# Asegurarse de que window_length no exceda la dimensión del espectro
+if window_length >= dim_z:
+    print(f"Advertencia: window_length ({window_length}) es mayor o igual que la dimensión espectral ({dim_z}). Ajustando window_length a {dim_z - 1} si es par, o {dim_z - 2} si es impar para permitir polyorder.")
+    window_length = dim_z - 2 if (dim_z - 2) % 2 != 0 else dim_z - 3
+    if window_length < 3: # Asegurar un mínimo de 3 para el suavizado
+        window_length = 3
+    if polyorder >= window_length:
+        polyorder = window_length - 1
+
+cubo_suavizado = np.zeros_like(cubo_crop)
+for i in range(cubo_crop.shape[0]): # Iterar sobre Y
+    for j in range(cubo_crop.shape[1]): # Iterar sobre X
+        # Asegurarse de que el espectro no sea todo NaN antes de suavizar
+        if not np.all(np.isnan(cubo_crop[i, j, :])):
+            cubo_suavizado[i, j, :] = savgol_filter(cubo_crop[i, j, :], window_length=window_length, polyorder=polyorder)
+        else:
+            cubo_suavizado[i, j, :] = cubo_crop[i, j, :] # Mantener NaNs si el espectro es todo NaN
+
+print(f"Espectros suavizados con window_length={window_length}, polyorder={polyorder}")
+
+# --- 4. Preparación de Datos para el Modelo ---
+# X serán las características: cubo espectral (suavizado) y mapa Tex
+# Y será la variable a predecir: la densidad de columna verdadera
+
+# Aplanar el cubo: cada fila es un píxel, columnas son canales de velocidad
+# Usamos el cubo_suavizado
+X_cubo_aplanado = cubo_suavizado.reshape(-1, dim_z)
+
+# Aplanar el mapa Tex: cada fila es un píxel
+X_tex_aplanado = tex_crop.reshape(-1, 1)
+
+# Concatenar solo las características que queremos: cubo y Tex
+X_total = np.hstack((X_cubo_aplanado, X_tex_aplanado))
+
+# Aplanar el mapa de densidad de columna "verdadera" para Y
+y_total = N13CO_crop_true.reshape(-1)
+
+# --- 5. Filtrar NaN y Outliers Extremos ---
+# Identificación y eliminación de Outliers en y_total (densidad de columna)
+# Calculamos IQR para la densidad de columna
+Q1 = np.nanpercentile(y_total, 25)
+Q3 = np.nanpercentile(y_total, 75)
+IQR = Q3 - Q1
+lower_bound = Q1 - 1.5 * IQR
+upper_bound = Q3 + 1.5 * IQR
+
+# Criterio de validez ampliado para incluir el filtro de outliers
+validos_y = ~np.isnan(y_total) & (y_total >= lower_bound) & (y_total <= upper_bound)
+validos_X = ~np.isnan(X_total).any(axis=1)
+
+# Combinar ambos criterios de validez
+validos = validos_y & validos_X
+
+X = X_total[validos]
+y = y_total[validos]
+
+print(f"Píxeles totales antes del filtro: {len(y_total)}")
+print(f"Píxeles después del filtro de NaN y Outliers: {len(y)}")
+
+# --- 6. Escalado de Datos ---
+scaler_X = StandardScaler()
+scaler_y = StandardScaler()
+
+X_scaled = scaler_X.fit_transform(X)
+y_scaled = scaler_y.fit_transform(y.reshape(-1, 1)).flatten()
+
+# --- 7. División Train/Test/Validación ---
+X_train, X_temp, y_train, y_temp = train_test_split(X_scaled, y_scaled, test_size=0.3, random_state=42)
+X_test, X_val, y_test, y_val = train_test_split(X_temp, y_temp, test_size=0.5, random_state=42)
+
+print(f"Tamaño del conjunto de entrenamiento: {len(y_train)}")
+print(f"Tamaño del conjunto de prueba (test): {len(y_test)}")
+print(f"Tamaño del conjunto de validación: {len(y_val)}")
+
+# --- 8. Randomized Search para optimización de Hiperparámetros ---
+# Incrementamos n_iter para una búsqueda más exhaustiva
+param_dist = {
+    'n_estimators': randint(100, 200), # Rango ligeramente expandido
+    'max_depth': [15, 25, None], # Probamos con más profundidad
+    'max_features': ['sqrt', 0.5, 0.7], # Probamos con más features
+    'min_samples_split': [2, 4, 6] # Más opciones de min_samples_split
+}
+
+rf = RandomForestRegressor(random_state=42, n_jobs=-1)
+random_search = RandomizedSearchCV(
+    estimator=rf,
+    param_distributions=param_dist,
+    n_iter=40, # Aumentamos el número de iteraciones
+    cv=3,
+    scoring='r2',
+    n_jobs=-1,
+    verbose=2,
+    random_state=42
+)
+
+print("\nIniciando entrenamiento del modelo con RandomizedSearchCV...")
+random_search.fit(X_train, y_train)
+
+# --- 9. Resultados de RandomizedSearchCV ---
+print("\n--- Resultados de RandomizedSearchCV ---")
+print(f"Mejores parámetros encontrados: {random_search.best_params_}")
+print(f"Mejor R² en validación cruzada: {random_search.best_score_:.4f}")
+
+# --- 10. Evaluación del Modelo en Conjunto de Prueba (Test) ---
+best_model = random_search.best_estimator_
+y_pred_test = best_model.predict(X_test)
+
+r2_test = r2_score(y_test, y_pred_test)
+mse_test = mean_squared_error(y_test, y_pred_test)
+
+print(f"\n--- Evaluación en el Conjunto de Prueba (Test) ---")
+print(f"R² en test: {r2_test:.4f}")
+print(f"MSE en test: {mse_test:.4f}")
+
+# --- 11. Evaluación Adicional en Conjunto de Validación ---
+y_pred_val = best_model.predict(X_val)
+
+r2_val = r2_score(y_val, y_pred_val)
+mse_val = mean_squared_error(y_val, y_pred_val)
+
+print(f"\n--- Evaluación en el Conjunto de Validación ---")
+print(f"R² en validación: {r2_val:.4f}")
+print(f"MSE en validación: {mse_val:.4f}")
+
+# --- NUEVA MEJORA: Visualización de Importancia de Características ---
+print("\n--- Analizando Importancia de Características ---")
+feature_importances = best_model.feature_importances_
+
+# Los primeros dim_z (399) corresponden a los canales espectrales, el último a Tex
+# Separamos las importancias del espectro y de Tex
+importances_espectro = feature_importances[:-1] # Todos menos el último
+importance_tex = feature_importances[-1] # El último es Tex
+
+print(f"Importancia de la característica Tex: {importance_tex:.4f}")
+
+
+# --- 12. Guardado de Modelo y Escaladores ---
+joblib.dump(best_model, 'modelo_densidad_mejorado_cubo_tex.pkl') # Nuevo nombre
+joblib.dump(scaler_X, 'scaler_X_mejorado_cubo_tex.pkl') # Nuevo nombre
+joblib.dump(scaler_y, 'scaler_y_densidad_columna.pkl')
+pd.DataFrame(random_search.cv_results_).to_csv("resultados_randomsearch_mejorado_cubo_tex.csv", index=False)
+
+print("\nModelo y resultados (mejorados) guardados exitosamente.")
