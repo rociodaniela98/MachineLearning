@@ -1,0 +1,224 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import joblib
+from astropy.io import fits
+from astropy.wcs import WCS
+import warnings
+from astropy.wcs import FITSFixedWarning
+from sklearn.model_selection import train_test_split
+from scipy.signal import savgol_filter # Necesario para el suavizado
+
+# Silenciar warnings de WCS
+warnings.simplefilter('ignore', category=FITSFixedWarning)
+
+# --- 1. Carga de Datos Originales (para obtener el mapa "verdadero") ---
+cubo_hdu = fits.open("13co32cubo.fits")[0]
+mapa_tex_data = fits.open("mapaTex.fits")[0].data
+mapa_nc_hdu = fits.open("mapaN13.fits")[0] # Mapa de densidad de columna "verdadera"
+
+# --- 2. Inicializar WCS y Dimensiones Originales ---
+wcs_cubo = WCS(cubo_hdu.header)
+wcs_mapa = WCS(mapa_nc_hdu.header)
+
+dim_z, dim_y, dim_x = cubo_hdu.data.shape
+cubo_procesado = np.transpose(cubo_hdu.data, (1, 2, 0))
+
+# --- 3. Recorte Central y Sincronización de Dimensiones (igual que en el entrenamiento) ---
+x_center = dim_x // 2
+y_center = dim_y // 2
+ra_center, dec_center, _ = wcs_cubo.all_pix2world(x_center, y_center, 0, 0)
+x_pix_mapa, y_pix_mapa, _ = wcs_mapa.all_world2pix(ra_center, dec_center, 0, 0)
+
+x_pix_mapa = int(np.round(x_pix_mapa))
+y_pix_mapa = int(np.round(y_pix_mapa))
+
+start_x = max(0, x_pix_mapa - (dim_x // 2))
+end_x   = min(mapa_tex_data.shape[1], start_x + dim_x)
+start_y = max(0, y_pix_mapa - (dim_y // 2))
+end_y   = min(mapa_tex_data.shape[0], start_y + dim_y)
+
+tex_crop = mapa_tex_data[start_y:end_y, start_x:end_x]
+N13CO_crop_true = mapa_nc_hdu.data[start_y:end_y, start_x:end_x]
+cubo_crop = cubo_procesado[0:(end_y - start_y), 0:(end_x - start_x), :]
+
+if not (tex_crop.shape == N13CO_crop_true.shape == cubo_crop.shape[:2]):
+    print(f"Dimensiones de tex_crop: {tex_crop.shape}")
+    print(f"Dimensiones de N13CO_crop_true: {N13CO_crop_true.shape}")
+    print(f"Dimensiones espaciales de cubo_crop: {cubo_crop.shape[:2]}")
+    raise ValueError("Las dimensiones espaciales de los datos recortados NO COINCIDEN. Por favor, revisa tus archivos FITS y los límites de recorte.")
+
+
+# --- Aplicar el mismo Suavizado Ligero del Espectro que en el entrenamiento ---
+window_length = 7
+polyorder = 2
+
+if window_length >= dim_z:
+    window_length = dim_z - 2 if (dim_z - 2) % 2 != 0 else dim_z - 3
+    if window_length < 3:
+        window_length = 3
+    if polyorder >= window_length:
+        polyorder = window_length - 1
+
+cubo_suavizado = np.zeros_like(cubo_crop)
+for i in range(cubo_crop.shape[0]):
+    for j in range(cubo_crop.shape[1]):
+        if not np.all(np.isnan(cubo_crop[i, j, :])):
+            cubo_suavizado[i, j, :] = savgol_filter(cubo_crop[i, j, :], window_length=window_length, polyorder=polyorder)
+        else:
+            cubo_suavizado[i, j, :] = cubo_crop[i, j, :]
+
+print(f"Espectros suavizados con window_length={window_length}, polyorder={polyorder}")
+
+
+# --- 4. Preparación de Datos para el Modelo (igual que en el entrenamiento) ---
+# Usamos el cubo suavizado
+X_cubo_aplanado = cubo_suavizado.reshape(-1, dim_z)
+X_tex_aplanado = tex_crop.reshape(-1, 1)
+
+# X_total_full incluye TODOS los 399 canales + Tex para los píxeles recortados.
+X_total_full = np.hstack((X_cubo_aplanado, X_tex_aplanado))
+
+# CREAR LA VARIABLE PARA EL MAPA COMPLETO AQUÍ (cubo original suavizado + Tex)
+# Esto es para tener las características de entrada de todos los píxeles del mapa
+# antes de cualquier filtrado de NaN/outliers.
+X_total_full_original_combined = np.hstack((cubo_suavizado.reshape(-1, dim_z), tex_crop.reshape(-1, 1)))
+
+
+y_total_full = N13CO_crop_true.reshape(-1)
+
+# --- 5. Filtrar NaN y Outliers Extremos (igual que en el entrenamiento) ---
+Q1 = np.nanpercentile(y_total_full, 25)
+Q3 = np.nanpercentile(y_total_full, 75)
+IQR = Q3 - Q1
+lower_bound = Q1 - 1.5 * IQR
+upper_bound = Q3 + 1.5 * IQR
+
+validos_y = ~np.isnan(y_total_full) & (y_total_full >= lower_bound) & (y_total_full <= upper_bound)
+validos_X = ~np.isnan(X_total_full).any(axis=1)
+validos = validos_y & validos_X
+
+X_filtrado_completo = X_total_full[validos]
+y_filtrado_completo = y_total_full[validos]
+
+print(f"Píxeles totales antes del filtro: {len(y_total_full)}")
+print(f"Píxeles después del filtro de NaN y Outliers: {len(y_filtrado_completo)}")
+
+
+# --- 6. Carga del Modelo y Escaladores MEJORADOS ---
+try:
+    best_model = joblib.load('modelo_densidad_mejorado_cubo_tex.pkl')
+    scaler_X = joblib.load('scaler_X_mejorado_cubo_tex.pkl')
+    scaler_y = joblib.load('scaler_y_densidad_columna.pkl')
+    print("Modelo y escaladores (mejorados) cargados exitosamente.")
+except FileNotFoundError:
+    print("Error: Asegúrate de que 'modelo_densidad_mejorado_cubo_tex.pkl', 'scaler_X_mejorado_cubo_tex.pkl' y 'scaler_y_densidad_columna.pkl' existan en el mismo directorio.")
+    exit()
+
+# --- 7. Aplicar la misma división train/test/val para obtener los datos del conjunto de test y validación ---
+X_scaled_full = scaler_X.transform(X_filtrado_completo)
+y_scaled_full = scaler_y.transform(y_filtrado_completo.reshape(-1, 1)).flatten()
+
+_, X_temp, _, y_temp = train_test_split(X_scaled_full, y_scaled_full, test_size=0.3, random_state=42)
+X_test_final, X_val_final, y_test_scaled_final, y_val_scaled_final = train_test_split(X_temp, y_temp, test_size=0.5, random_state=42)
+
+# --- 8. PREPARACIÓN DE X PARA PREDICCIÓN (el modelo fue entrenado con todas las características) ---
+# El modelo fue entrenado con X_total_full (399 canales + Tex).
+# Por lo tanto, X_test_final y X_val_final ya tienen la forma correcta (399+1 = 400 características).
+X_test_for_prediction = X_test_final
+X_val_for_prediction = X_val_final
+
+print(f"Forma de X_test_for_prediction: {X_test_for_prediction.shape}")
+print(f"Forma de X_val_for_prediction: {X_val_for_prediction.shape}")
+
+
+# --- 9. Obtener predicciones y valores verdaderos desescalados para los conjuntos de test y validación ---
+y_test_pred_scaled = best_model.predict(X_test_for_prediction)
+y_val_pred_scaled = best_model.predict(X_val_for_prediction)
+
+y_pred_combined_scaled = np.concatenate((y_test_pred_scaled, y_val_pred_scaled))
+y_true_combined_scaled = np.concatenate((y_test_scaled_final, y_val_scaled_final))
+
+# Desescalar los valores para la visualización
+y_pred_combined_desescalada = scaler_y.inverse_transform(y_pred_combined_scaled.reshape(-1, 1)).flatten()
+y_true_combined_desescalada = scaler_y.inverse_transform(y_true_combined_scaled.reshape(-1, 1)).flatten()
+
+# --- 10. Visualización: Gráfico de Dispersión Verdadero vs. Predicho ---
+plt.figure(figsize=(8, 8))
+plt.scatter(y_true_combined_desescalada, y_pred_combined_desescalada, alpha=0.3, s=10)
+plt.plot([min(y_true_combined_desescalada), max(y_true_combined_desescalada)],
+         [min(y_true_combined_desescalada), max(y_true_combined_desescalada)],
+         color='red', linestyle='--', label='Línea Y=X (Predicción Perfecta)')
+plt.xlabel('Densidad de Columna Verdadera')
+plt.ylabel('Densidad de Columna Predicha')
+plt.title('Densidad de Columna: Verdadera vs. Predicha (Test + Validación)')
+plt.grid(True)
+plt.legend()
+plt.axis('equal')
+plt.show()
+
+# --- Visualización de Mapas de Densidad (Verdadero, Predicho, Residuos) ---
+# Para reconstruir los mapas 2D, necesitamos predecir sobre TODOS los píxeles válidos originales.
+# Esto incluye tanto los de entrenamiento como los de test/validación.
+
+# Ahora X_total_full_original_combined está definida desde el principio.
+# Aplicamos la misma máscara 'validos' para asegurar que solo consideramos píxeles que el modelo "vio" durante el entrenamiento.
+X_pred_all_valid_original_form = X_total_full_original_combined[validos]
+
+# Escalamos estas características.
+X_pred_all_valid_scaled_for_map = scaler_X.transform(X_pred_all_valid_original_form)
+
+# Obtenemos las predicciones escaladas para los píxeles válidos
+y_pred_all_scaled_for_map = best_model.predict(X_pred_all_valid_scaled_for_map)
+
+# Desescalamos las predicciones
+y_pred_all_desescalada_for_map = scaler_y.inverse_transform(y_pred_all_scaled_for_map.reshape(-1, 1)).flatten()
+
+# Creamos un array 1D que tendrá los NaNs para los píxeles no válidos o eliminados
+full_map_shape_flat = N13CO_crop_true.size # 73 * 60 = 4380
+
+mapa_verdadero_reconstruido_flat = np.full(full_map_shape_flat, np.nan)
+mapa_predicho_reconstruido_flat = np.full(full_map_shape_flat, np.nan)
+
+# Colocamos los valores predichos y verdaderos desescalados en las posiciones correctas
+# dentro de los arrays aplanados completos, usando la máscara 'validos'
+mapa_predicho_reconstruido_flat[validos] = y_pred_all_desescalada_for_map
+mapa_verdadero_reconstruido_flat[validos] = y_total_full[validos] # Los valores verdaderos ya están desescalados
+
+# Remodelar a la forma 2D original
+mapa_predicho_2d = mapa_predicho_reconstruido_flat.reshape(N13CO_crop_true.shape)
+mapa_verdadero_2d = mapa_verdadero_reconstruido_flat.reshape(N13CO_crop_true.shape)
+
+# Calcular los residuos
+residuos = mapa_verdadero_2d - mapa_predicho_2d
+
+# Encontrar los valores min/max para cbar para Verdadero y Predicho
+vmin_common = np.nanmin([mapa_verdadero_2d, mapa_predicho_2d])
+vmax_common = np.nanmax([mapa_verdadero_2d, mapa_predicho_2d])
+
+# Encontrar los valores min/max para cbar para Residuos (simétrico alrededor de cero)
+vmax_res = np.nanmax(np.abs(residuos))
+vmin_res = -vmax_res
+
+# Graficar los mapas
+fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+
+# Mapa Verdadero
+im1 = axes[0].imshow(mapa_verdadero_2d, origin='lower', cmap='viridis',
+                     vmin=vmin_common, vmax=vmax_common)
+axes[0].set_title('Densidad de Columna Verdadera')
+fig.colorbar(im1, ax=axes[0], label='Densidad de Columna')
+
+# Mapa Predicho
+im2 = axes[1].imshow(mapa_predicho_2d, origin='lower', cmap='viridis',
+                     vmin=vmin_common, vmax=vmax_common)
+axes[1].set_title('Densidad de Columna Predicha')
+fig.colorbar(im2, ax=axes[1], label='Densidad de Columna')
+
+# Mapa de Residuos
+im3 = axes[2].imshow(residuos, origin='lower', cmap='coolwarm',
+                     vmin=vmin_res, vmax=vmax_res)
+axes[2].set_title('Residuos (Verdadero - Predicho)')
+fig.colorbar(im3, ax=axes[2], label='Residuos')
+
+plt.tight_layout()
+plt.show()
