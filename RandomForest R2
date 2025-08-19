@@ -1,5 +1,4 @@
 import numpy as np
-import pandas as pd
 import joblib
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import train_test_split, RandomizedSearchCV
@@ -10,201 +9,257 @@ from astropy.io import fits
 from astropy.wcs import WCS
 import warnings
 from astropy.wcs import FITSFixedWarning
-from scipy.signal import savgol_filter # Para suavizado
+from scipy.signal import savgol_filter
+import matplotlib.pyplot as plt
 
-# Silenciar warnings de WCS
+# Silenciar warnings de WCS (pueden ser comunes con algunos archivos FITS)
 warnings.simplefilter('ignore', category=FITSFixedWarning)
 
-# --- 1. Carga de Datos ---
+# --- 1. Cargar datos ---
+# Carga el cubo espectral (intensidad vs. velocidad/frecuencia en cada punto espacial)
 cubo_hdu = fits.open("13co32cubo.fits")[0]
+# Carga el mapa de temperatura de excitación
 mapa_tex_data = fits.open("mapaTex.fits")[0].data
-mapa_nc_hdu = fits.open("mapaN13.fits")[0] # Mapa de densidad de columna "verdadera" para el entrenamiento
+# Carga el mapa de densidad de columna verdadera (será nuestra variable a predecir)
+mapa_nc_hdu = fits.open("mapaN13.fits")[0].data
 
 # --- 2. Inicializar WCS y Dimensiones ---
+# Inicializa el sistema de coordenadas del mundo (WCS) para el cubo
 wcs_cubo = WCS(cubo_hdu.header)
-wcs_mapa = WCS(mapa_nc_hdu.header)
+# Inicializa el WCS para el mapa de densidad de columna (se asume que es el mismo para Tex)
+wcs_mapa = WCS(fits.open("mapaN13.fits")[0].header)
 
+# Obtiene las dimensiones del cubo (velocidades, Y espacial, X espacial)
 dim_z, dim_y, dim_x = cubo_hdu.data.shape
+# Transpone el cubo a un formato (Y espacial, X espacial, velocidades) para facilitar el procesamiento
 cubo_procesado = np.transpose(cubo_hdu.data, (1, 2, 0))
 
-print(f"Forma procesada del cubo: {cubo_procesado.shape}")
-
-# --- 3. Recorte Central y Sincronización de Dimensiones ---
-x_center = dim_x // 2
-y_center = dim_y // 2
+# --- 3. Recorte central y sincronización ---
+# Calcula el centro del cubo en píxeles
+x_center, y_center = dim_x // 2, dim_y // 2
+# Convierte el centro del cubo de píxeles a coordenadas celestes (RA, Dec)
 ra_center, dec_center, _ = wcs_cubo.all_pix2world(x_center, y_center, 0, 0)
+# Convierte las coordenadas celestes de vuelta a píxeles en el sistema del mapa
 x_pix_mapa, y_pix_mapa, _ = wcs_mapa.all_world2pix(ra_center, dec_center, 0, 0)
 
-x_pix_mapa = int(np.round(x_pix_mapa))
-y_pix_mapa = int(np.round(y_pix_mapa))
+# Redondea y convierte las coordenadas de píxeles del mapa a enteros
+x_pix_mapa, y_pix_mapa = int(np.round(x_pix_mapa)), int(np.round(y_pix_mapa))
 
-start_x = max(0, x_pix_mapa - (dim_x // 2))
-end_x   = min(mapa_tex_data.shape[1], start_x + dim_x)
-start_y = max(0, y_pix_mapa - (dim_y // 2))
-end_y   = min(mapa_tex_data.shape[0], start_y + dim_y)
+# Define los límites del recorte en el mapa, centrado y del mismo tamaño que el cubo
+start_x_mapa = max(0, x_pix_mapa - dim_x // 2)
+end_x_mapa = min(mapa_tex_data.shape[1], start_x_mapa + dim_x)
+start_y_mapa = max(0, y_pix_mapa - dim_y // 2)
+end_y_mapa = min(mapa_tex_data.shape[0], start_y_mapa + dim_y)
 
-tex_crop = mapa_tex_data[start_y:end_y, start_x:end_x]
-N13CO_crop_true = mapa_nc_hdu.data[start_y:end_y, start_x:end_x]
-cubo_crop = cubo_procesado[0:(end_y - start_y), 0:(end_x - start_x), :]
+# Calcula las dimensiones espaciales del cubo recortado para asegurar coincidencia
+cubo_spatial_width = end_x_mapa - start_x_mapa
+cubo_spatial_height = end_y_mapa - start_y_mapa
 
+# Recorta el cubo y los mapas para que todos tengan las mismas dimensiones espaciales
+cubo_crop = cubo_procesado[0:cubo_spatial_height, 0:cubo_spatial_width, :]
+tex_crop = mapa_tex_data[start_y_mapa:end_y_mapa, start_x_mapa:end_x_mapa]
+N13CO_crop_true = mapa_nc_hdu[start_y_mapa:end_y_mapa, start_x_mapa:end_x_mapa]
+
+# Verifica que las dimensiones espaciales de los datos recortados coincidan
 if not (tex_crop.shape == N13CO_crop_true.shape == cubo_crop.shape[:2]):
-    print(f"Dimensiones de tex_crop: {tex_crop.shape}")
-    print(f"Dimensiones de N13CO_crop_true: {N13CO_crop_true.shape}")
-    print(f"Dimensiones espaciales de cubo_crop: {cubo_crop.shape[:2]}")
-    raise ValueError("Las dimensiones espaciales de los datos recortados NO COINCIDEN. Por favor, revisa tus archivos FITS y los límites de recorte.")
+    raise ValueError(f"Dimensiones espaciales de los datos recortados NO COINCIDEN."
+                     f" Tex shape: {tex_crop.shape}, N13CO shape: {N13CO_crop_true.shape}, Cubo spatial shape: {cubo_crop.shape[:2]}")
 
-print(f"Dimensiones de los mapas recortados (Y, X): {tex_crop.shape}")
-print(f"Dimensiones del cubo recortado (Y, X, Z): {cubo_crop.shape}")
+print(f"Dimensiones del cubo recortado: {cubo_crop.shape}")
+print(f"Dimensiones del mapa Tex recortado: {tex_crop.shape}")
+print(f"Dimensiones del mapa N13CO recortado: {N13CO_crop_true.shape}")
 
+# --- 4. Suavizado espectral ---
+# Parámetros para el filtro Savitzky-Golay
+window_length, polyorder = 7, 2 # Longitud de la ventana debe ser impar, polyorder < window_length
 
-# --- NUEVA MEJORA: Suavizado Ligero del Espectro ---
-# Aplicar un filtro Savitzky-Golay a cada espectro
-# window_length debe ser impar y menor que dim_z
-# polyorder debe ser menor que window_length
-# Ajusta estos valores según el ruido de tus espectros
-window_length = 7 # Por ejemplo, 7 canales. Puedes probar con 5 o 9.
-polyorder = 2   # Grado polinomial. Suele ser 1, 2 o 3.
-
-# Asegurarse de que window_length no exceda la dimensión del espectro
+# Ajusta la longitud de la ventana si es mayor que el número de canales espectrales
 if window_length >= dim_z:
-    print(f"Advertencia: window_length ({window_length}) es mayor o igual que la dimensión espectral ({dim_z}). Ajustando window_length a {dim_z - 1} si es par, o {dim_z - 2} si es impar para permitir polyorder.")
-    window_length = dim_z - 2 if (dim_z - 2) % 2 != 0 else dim_z - 3
-    if window_length < 3: # Asegurar un mínimo de 3 para el suavizado
-        window_length = 3
-    if polyorder >= window_length:
-        polyorder = window_length - 1
+    window_length = max(3, dim_z - 2 if (dim_z - 2) % 2 != 0 else dim_z - 3)
+    polyorder = min(polyorder, window_length - 1)
+    print(f"Advertencia: 'window_length' ajustado a {window_length} y 'polyorder' a {polyorder} debido a las dimensiones del espectro.")
 
 cubo_suavizado = np.zeros_like(cubo_crop)
-for i in range(cubo_crop.shape[0]): # Iterar sobre Y
-    for j in range(cubo_crop.shape[1]): # Iterar sobre X
-        # Asegurarse de que el espectro no sea todo NaN antes de suavizar
-        if not np.all(np.isnan(cubo_crop[i, j, :])):
-            cubo_suavizado[i, j, :] = savgol_filter(cubo_crop[i, j, :], window_length=window_length, polyorder=polyorder)
+for i in range(cubo_crop.shape[0]):
+    for j in range(cubo_crop.shape[1]):
+        espectro = cubo_crop[i, j, :]
+        
+        # Convierte NaNs y valores negativos a 0, asumiendo que representan "sin emisión".
+        # Esto es crucial antes de aplicar el filtro Savitzky-Golay.
+        espectro_para_procesar = np.nan_to_num(espectro, nan=0.0)
+        espectro_para_procesar[espectro_para_procesar < 0] = 0.0
+
+        if not np.all(espectro_para_procesar == 0.0): # Aplica el filtro solo si hay señal
+            cubo_suavizado[i, j, :] = savgol_filter(espectro_para_procesar, window_length, polyorder)
         else:
-            cubo_suavizado[i, j, :] = cubo_crop[i, j, :] # Mantener NaNs si el espectro es todo NaN
+            cubo_suavizado[i, j, :] = espectro # Mantiene NaNs originales si era todo NaN/0 para el filtrado posterior
 
-print(f"Espectros suavizados con window_length={window_length}, polyorder={polyorder}")
+# --- 5. Preparar datos para el modelo (solo espectro suavizado y temperatura) ---
+# Aplanar los espectros suavizados: cada píxel se convierte en una fila,
+# y cada canal de velocidad es una columna (característica)
+X_cubo_flat = cubo_suavizado.reshape(-1, cubo_suavizado.shape[2])
+# Aplanar el mapa de temperatura: cada píxel es una fila, la temperatura es una columna
+X_tex_flat = tex_crop.reshape(-1, 1)
 
-# --- 4. Preparación de Datos para el Modelo ---
-# X serán las características: cubo espectral (suavizado) y mapa Tex
-# Y será la variable a predecir: la densidad de columna verdadera
-
-# Aplanar el cubo: cada fila es un píxel, columnas son canales de velocidad
-# Usamos el cubo_suavizado
-X_cubo_aplanado = cubo_suavizado.reshape(-1, dim_z)
-
-# Aplanar el mapa Tex: cada fila es un píxel
-X_tex_aplanado = tex_crop.reshape(-1, 1)
-
-# Concatenar solo las características que queremos: cubo y Tex
-X_total = np.hstack((X_cubo_aplanado, X_tex_aplanado))
-
-# Aplanar el mapa de densidad de columna "verdadera" para Y
+# Concatenar todas las características de entrada (espectros y temperatura)
+X_total = np.hstack((X_cubo_flat, X_tex_flat))
+# Aplanar el mapa de densidad de columna verdadera (nuestra variable objetivo)
 y_total = N13CO_crop_true.reshape(-1)
 
-# --- 5. Filtrar NaN y Outliers Extremos ---
-# Identificación y eliminación de Outliers en y_total (densidad de columna)
-# Calculamos IQR para la densidad de columna
-Q1 = np.nanpercentile(y_total, 25)
-Q3 = np.nanpercentile(y_total, 75)
-IQR = Q3 - Q1
-lower_bound = Q1 - 1.5 * IQR
-upper_bound = Q3 + 1.5 * IQR
-
-# Criterio de validez ampliado para incluir el filtro de outliers
-validos_y = ~np.isnan(y_total) & (y_total >= lower_bound) & (y_total <= upper_bound)
+# --- 6. Filtrar NaN y valores no positivos ---
+# Identifica los píxeles donde la densidad de columna es válida y positiva
+validos_y = ~np.isnan(y_total) & (y_total > 0)
+# Identifica los píxeles donde ninguna de las características de entrada es NaN
 validos_X = ~np.isnan(X_total).any(axis=1)
-
-# Combinar ambos criterios de validez
+# Combina ambas condiciones para obtener solo los píxeles completamente válidos
 validos = validos_y & validos_X
 
+# Aplica el filtro para seleccionar solo los datos válidos
 X = X_total[validos]
 y = y_total[validos]
 
-print(f"Píxeles totales antes del filtro: {len(y_total)}")
-print(f"Píxeles después del filtro de NaN y Outliers: {len(y)}")
+print(f"Píxeles antes del filtrado: {len(y_total)}")
+print(f"Píxeles después del filtrado: {len(y)}")
 
-# --- 6. Escalado de Datos ---
+# --- 7. Escalar datos ---
+# Inicializa y entrena escaladores para las características (X) y la variable objetivo (y)
+# Esto estandariza los datos (media=0, desviación estándar=1)
 scaler_X = StandardScaler()
 scaler_y = StandardScaler()
-
 X_scaled = scaler_X.fit_transform(X)
 y_scaled = scaler_y.fit_transform(y.reshape(-1, 1)).flatten()
 
-# --- 7. División Train/Test/Validación ---
+# --- 8. División de datos (Entrenamiento, Prueba, Validación) ---
+# Divide los datos escalados en conjuntos de entrenamiento, temporal y validación
 X_train, X_temp, y_train, y_temp = train_test_split(X_scaled, y_scaled, test_size=0.3, random_state=42)
-X_test, X_val, y_test, y_val = train_test_split(X_temp, y_temp, test_size=0.5, random_state=42)
+X_test, X_val, y_test, y_val = train_test_split(X_temp, y_temp, test_size=0.5, random_state=42) # 0.5 de 0.3 es 0.15 total para test y 0.15 para val
 
-print(f"Tamaño del conjunto de entrenamiento: {len(y_train)}")
-print(f"Tamaño del conjunto de prueba (test): {len(y_test)}")
-print(f"Tamaño del conjunto de validación: {len(y_val)}")
-
-# --- 8. Randomized Search para optimización de Hiperparámetros ---
-# Incrementamos n_iter para una búsqueda más exhaustiva
+# --- 9. Entrenamiento del modelo (Random Forest con RandomizedSearchCV) ---
+# Define la distribución de hiperparámetros a explorar para Random Forest
 param_dist = {
-    'n_estimators': randint(100, 200), # Rango ligeramente expandido
-    'max_depth': [15, 25, None], # Probamos con más profundidad
-    'max_features': ['sqrt', 0.5, 0.7], # Probamos con más features
-    'min_samples_split': [2, 4, 6] # Más opciones de min_samples_split
+    'n_estimators': randint(150, 500), # Número de árboles en el bosque
+    'max_depth': [15, 25, 35, None], # Profundidad máxima de los árboles (None significa sin límite)
+    'max_features': ['sqrt', 0.5, 0.7, 0.9], # Número de características a considerar para cada división
+    'min_samples_split': randint(2, 10), # Mínimo de muestras requeridas para dividir un nodo interno
+    'min_samples_leaf': randint(1, 5) # Mínimo de muestras requeridas en una hoja
 }
 
-rf = RandomForestRegressor(random_state=42, n_jobs=-1)
+# Inicializa el Random Forest Regressor
+rf = RandomForestRegressor(random_state=42, n_jobs=-1) # n_jobs=-1 usa todos los núcleos disponibles
+# Configura RandomizedSearchCV para buscar los mejores hiperparámetros
 random_search = RandomizedSearchCV(
     estimator=rf,
     param_distributions=param_dist,
-    n_iter=40, # Aumentamos el número de iteraciones
-    cv=3,
-    scoring='r2',
+    n_iter=30, # Número de combinaciones de parámetros a probar
+    cv=5, # Número de folds para la validación cruzada
+    scoring='r2', # Métrica de evaluación (coeficiente de determinación)
     n_jobs=-1,
-    verbose=2,
+    verbose=2, # Muestra progreso detallado
     random_state=42
 )
 
-print("\nIniciando entrenamiento del modelo con RandomizedSearchCV...")
-random_search.fit(X_train, y_train)
+print("Entrenando modelo...")
+random_search.fit(X_train, y_train) # Entrena el modelo usando los datos de entrenamiento
+best_model = random_search.best_estimator_ # Obtiene el mejor modelo encontrado
+print(f"Mejores parámetros: {random_search.best_params_}")
 
-# --- 9. Resultados de RandomizedSearchCV ---
-print("\n--- Resultados de RandomizedSearchCV ---")
-print(f"Mejores parámetros encontrados: {random_search.best_params_}")
-print(f"Mejor R² en validación cruzada: {random_search.best_score_:.4f}")
+# --- 10. Evaluar el modelo ---
+# Función para evaluar el modelo e imprimir métricas
+def evaluar(y_true, y_pred, dataset="Conjunto"):
+    r2 = r2_score(y_true, y_pred)
+    mse = mean_squared_error(y_true, y_pred)
+    print(f"{dataset}: R²={r2:.4f}, MSE={mse:.4f}")
 
-# --- 10. Evaluación del Modelo en Conjunto de Prueba (Test) ---
-best_model = random_search.best_estimator_
+# Realiza predicciones en los conjuntos de entrenamiento, prueba y validación
+y_pred_train = best_model.predict(X_train)
 y_pred_test = best_model.predict(X_test)
-
-r2_test = r2_score(y_test, y_pred_test)
-mse_test = mean_squared_error(y_test, y_pred_test)
-
-print(f"\n--- Evaluación en el Conjunto de Prueba (Test) ---")
-print(f"R² en test: {r2_test:.4f}")
-print(f"MSE en test: {mse_test:.4f}")
-
-# --- 11. Evaluación Adicional en Conjunto de Validación ---
 y_pred_val = best_model.predict(X_val)
 
-r2_val = r2_score(y_val, y_pred_val)
-mse_val = mean_squared_error(y_val, y_pred_val)
+# Evalúa e imprime las métricas para cada conjunto
+evaluar(y_train, y_pred_train, "Entrenamiento")
+evaluar(y_test, y_pred_test, "Test")
+evaluar(y_val, y_pred_val, "Validación")
 
-print(f"\n--- Evaluación en el Conjunto de Validación ---")
-print(f"R² en validación: {r2_val:.4f}")
-print(f"MSE en validación: {mse_val:.4f}")
+# --- 11. Predicción completa y reconstrucción del mapa ---
+# Prepara las características para la predicción en el mapa completo.
+X_cubo_flat_full = cubo_suavizado.reshape(-1, cubo_suavizado.shape[2])
+X_tex_flat_full = tex_crop.reshape(-1, 1)
 
-# --- NUEVA MEJORA: Visualización de Importancia de Características ---
-print("\n--- Analizando Importancia de Características ---")
-feature_importances = best_model.feature_importances_
+# Concatena las características para el mapa completo (tendrá los mismos NaNs originales)
+X_full_predict_raw = np.hstack((X_cubo_flat_full, X_tex_flat_full))
 
-# Los primeros dim_z (399) corresponden a los canales espectrales, el último a Tex
-# Separamos las importancias del espectro y de Tex
-importances_espectro = feature_importances[:-1] # Todos menos el último
-importance_tex = feature_importances[-1] # El último es Tex
+# Escala todas las características. Los NaNs en X_full_predict_raw resultarán en NaNs en X_full_predict_scaled.
+# EL MODELO DE RANDOM FOREST NO PUEDE HACER PREDICCIONES CON NaNs EN LA ENTRADA,
+# ASÍ QUE DEBEMOS REEMPLAZARLOS O EVITARLOS PARA LA PREDICCIÓN.
+# La estrategia anterior filtraba para predecir solo los validos.
+# Para evitar los huecos blancos, tenemos dos opciones:
+#   1. Rellenar los NaNs en X_full_predict_raw con 0s ANTES de escalar y predecir.
+#      Esto implica que el modelo "predice" para esas zonas, asumiendo que un NaN significa 0 en las características.
+#   2. Predecir solo para los 'validos' como antes, y luego rellenar los 'no validos' en el mapa final con un valor (e.g., 0).
+#      Esta es la opción más segura para tu caso. Vamos a implementar esto.
 
-print(f"Importancia de la característica Tex: {importance_tex:.4f}")
+# Generar las predicciones solo para los píxeles que son válidos (no tienen NaN en X o no son negativos/NaN en y)
+X_for_prediction = X_full_predict_raw[validos]
+X_for_prediction_scaled = scaler_X.transform(X_for_prediction)
 
+y_pred_full_scaled = best_model.predict(X_for_prediction_scaled)
+y_pred_full = scaler_y.inverse_transform(y_pred_full_scaled.reshape(-1, 1)).flatten()
 
-# --- 12. Guardado de Modelo y Escaladores ---
-joblib.dump(best_model, 'modelo_densidad_mejorado_cubo_tex.pkl') # Nuevo nombre
-joblib.dump(scaler_X, 'scaler_X_mejorado_cubo_tex.pkl') # Nuevo nombre
-joblib.dump(scaler_y, 'scaler_y_densidad_columna.pkl')
-pd.DataFrame(random_search.cv_results_).to_csv("resultados_randomsearch_mejorado_cubo_tex.csv", index=False)
+# --- CAMBIO CLAVE PARA ELIMINAR LOS HUECOS BLANCOS ---
+# Crea un mapa plano lleno de CERO (o el valor que quieras para "sin emisión")
+# en lugar de NaNs. Los NaNs son lo que crea los "huecos" en la visualización de imshow.
+# Si los datos originales no existen o son cero, la predicción para esas áreas debería ser cero.
+mapa_predicho_flat = np.full(y_total.shape, 0.0) # <--- CAMBIO AQUÍ: Rellenar con 0.0 en lugar de np.nan
 
-print("\nModelo y resultados (mejorados) guardados exitosamente.")
+# Coloca las predicciones calculadas solo en las posiciones que fueron consideradas válidas
+mapa_predicho_flat[validos] = y_pred_full
+
+# Remodela el array plano a la forma 2D del mapa original
+mapa_predicho_2d = mapa_predicho_flat.reshape(N13CO_crop_true.shape)
+
+residuos = N13CO_crop_true - mapa_predicho_2d
+
+# --- 12. Graficar mapas ---
+vmin = 0.0 # np.nanmin([N13CO_crop_true, mapa_predicho_2d])
+vmax = np.nanmax([N13CO_crop_true, mapa_predicho_2d])
+# Define el rango de color para los residuos, centrado en cero
+vmax_res = np.nanmax(np.abs(residuos[~np.isnan(residuos)])) # Solo considerar residuos no NaN
+
+# Crea una figura con tres subplots
+fig, axes = plt.subplots(1, 3, figsize=(20, 7)) # Tamaño de figura aumentado
+
+# Mapa de Densidad de Columna Real
+# Aquí el mapa real seguirá mostrando NaNs si los tiene, lo que resultará en blanco.
+# Si quieres que el mapa real también muestre 0 donde hay NaNs, tendrías que hacer:
+N13CO_crop_true_for_plot = np.nan_to_num(N13CO_crop_true, nan=0.0)
+im1 = axes[0].imshow(N13CO_crop_true_for_plot, origin='lower', cmap='viridis', vmin=vmin, vmax=vmax)
+axes[0].set_title('Densidad de Columna Real (NaNs como 0)')
+plt.colorbar(im1, ax=axes[0], fraction=0.046, pad=0.04)
+
+# Mapa de Densidad de Columna Predicha
+im2 = axes[1].imshow(mapa_predicho_2d, origin='lower', cmap='viridis', vmin=vmin, vmax=vmax)
+axes[1].set_title('Densidad de Columna Predicha (sin huecos)')
+plt.colorbar(im2, ax=axes[1], fraction=0.046, pad=0.04)
+
+# Mapa de Residuos
+# Para los residuos, es mejor rellenar los NaNs con 0 para la visualización si el objetivo es ver el "error",
+# pero manteniendo la interpretación que un 0 aquí significa que no había dato real o la predicción fue 0.
+residuos_for_plot = np.nan_to_num(residuos, nan=0.0) # Rellenar NaNs en residuos con 0
+im3 = axes[2].imshow(residuos_for_plot, origin='lower', cmap='coolwarm', vmin=-vmax_res, vmax=vmax_res)
+axes[2].set_title('Residuos (Real - Predicho) (NaNs como 0)')
+plt.colorbar(im3, ax=axes[2], fraction=0.046, pad=0.04)
+
+plt.tight_layout() # Ajusta automáticamente los parámetros de los subplots
+plt.show() # Muestra la figura
+
+# Guardar el modelo y los escaladores ---
+joblib.dump(best_model, 'best_random_forest_model.pkl')
+joblib.dump(scaler_X, 'scaler_X.pkl')
+joblib.dump(scaler_y, 'scaler_y.pkl')
+print("Modelo y escaladores guardados.")
+
+# Guardar el mapa predicho en un archivo FITS ---
+new_hdu = fits.PrimaryHDU(data=mapa_predicho_2d)
+new_hdu.header = fits.open("mapaN13.fits")[0].header # Copiar cabecera del mapa original
+new_hdu.writeto("mapa_N13CO_predicho.fits", overwrite=True)
+print("Mapa de densidad de columna predicho guardado como mapa_N13CO_predicho.fits")
