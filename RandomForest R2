@@ -188,16 +188,6 @@ X_tex_flat_full = tex_crop.reshape(-1, 1)
 # Concatena las características para el mapa completo (tendrá los mismos NaNs originales)
 X_full_predict_raw = np.hstack((X_cubo_flat_full, X_tex_flat_full))
 
-# Escala todas las características. Los NaNs en X_full_predict_raw resultarán en NaNs en X_full_predict_scaled.
-# EL MODELO DE RANDOM FOREST NO PUEDE HACER PREDICCIONES CON NaNs EN LA ENTRADA,
-# ASÍ QUE DEBEMOS REEMPLAZARLOS O EVITARLOS PARA LA PREDICCIÓN.
-# La estrategia anterior filtraba para predecir solo los validos.
-# Para evitar los huecos blancos, tenemos dos opciones:
-#   1. Rellenar los NaNs en X_full_predict_raw con 0s ANTES de escalar y predecir.
-#      Esto implica que el modelo "predice" para esas zonas, asumiendo que un NaN significa 0 en las características.
-#   2. Predecir solo para los 'validos' como antes, y luego rellenar los 'no validos' en el mapa final con un valor (e.g., 0).
-#      Esta es la opción más segura para tu caso. Vamos a implementar esto.
-
 # Generar las predicciones solo para los píxeles que son válidos (no tienen NaN en X o no son negativos/NaN en y)
 X_for_prediction = X_full_predict_raw[validos]
 X_for_prediction_scaled = scaler_X.transform(X_for_prediction)
@@ -205,11 +195,7 @@ X_for_prediction_scaled = scaler_X.transform(X_for_prediction)
 y_pred_full_scaled = best_model.predict(X_for_prediction_scaled)
 y_pred_full = scaler_y.inverse_transform(y_pred_full_scaled.reshape(-1, 1)).flatten()
 
-# --- CAMBIO CLAVE PARA ELIMINAR LOS HUECOS BLANCOS ---
-# Crea un mapa plano lleno de CERO (o el valor que quieras para "sin emisión")
-# en lugar de NaNs. Los NaNs son lo que crea los "huecos" en la visualización de imshow.
-# Si los datos originales no existen o son cero, la predicción para esas áreas debería ser cero.
-mapa_predicho_flat = np.full(y_total.shape, 0.0) # <--- CAMBIO AQUÍ: Rellenar con 0.0 en lugar de np.nan
+mapa_predicho_flat = np.full(y_total.shape, 0.0) 
 
 # Coloca las predicciones calculadas solo en las posiciones que fueron consideradas válidas
 mapa_predicho_flat[validos] = y_pred_full
@@ -229,8 +215,6 @@ vmax_res = np.nanmax(np.abs(residuos[~np.isnan(residuos)])) # Solo considerar re
 fig, axes = plt.subplots(1, 3, figsize=(20, 7)) # Tamaño de figura aumentado
 
 # Mapa de Densidad de Columna Real
-# Aquí el mapa real seguirá mostrando NaNs si los tiene, lo que resultará en blanco.
-# Si quieres que el mapa real también muestre 0 donde hay NaNs, tendrías que hacer:
 N13CO_crop_true_for_plot = np.nan_to_num(N13CO_crop_true, nan=0.0)
 im1 = axes[0].imshow(N13CO_crop_true_for_plot, origin='lower', cmap='viridis', vmin=vmin, vmax=vmax)
 axes[0].set_title('Densidad de Columna Real (NaNs como 0)')
@@ -242,8 +226,7 @@ axes[1].set_title('Densidad de Columna Predicha (sin huecos)')
 plt.colorbar(im2, ax=axes[1], fraction=0.046, pad=0.04)
 
 # Mapa de Residuos
-# Para los residuos, es mejor rellenar los NaNs con 0 para la visualización si el objetivo es ver el "error",
-# pero manteniendo la interpretación que un 0 aquí significa que no había dato real o la predicción fue 0.
+
 residuos_for_plot = np.nan_to_num(residuos, nan=0.0) # Rellenar NaNs en residuos con 0
 im3 = axes[2].imshow(residuos_for_plot, origin='lower', cmap='coolwarm', vmin=-vmax_res, vmax=vmax_res)
 axes[2].set_title('Residuos (Real - Predicho) (NaNs como 0)')
