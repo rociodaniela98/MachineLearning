@@ -1,0 +1,231 @@
+import matplotlib.pyplot as plt
+import numpy as np
+import joblib
+import tensorflow as tf
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import r2_score, mean_squared_error
+from astropy.io import fits
+from astropy.wcs import WCS
+import warnings
+from astropy.wcs import FITSFixedWarning
+from scipy.signal import savgol_filter
+
+# Silenciar warnings de WCS
+warnings.simplefilter('ignore', category=FITSFixedWarning)
+
+# --- 1. Cargar datos (TODO ESTE BLOQUE ES TU CÓDIGO ORIGINAL) ---
+cubo_hdu = fits.open("13co32cubo.fits")[0]
+mapa_tex_data = fits.open("mapaTex.fits")[0].data
+mapa_nc_hdu = fits.open("mapaN13.fits")[0].data 
+
+# --- 2. Inicializar WCS y Dimensiones ---
+wcs_cubo = WCS(cubo_hdu.header)
+wcs_mapa = WCS(fits.open("mapaN13.fits")[0].header)
+
+dim_z, dim_y, dim_x = cubo_hdu.data.shape
+cubo_procesado = np.transpose(cubo_hdu.data, (1, 2, 0))
+
+# --- 3. Recorte central y sincronización ---
+x_center, y_center = dim_x // 2, dim_y // 2
+ra_center, dec_center, _ = wcs_cubo.all_pix2world(x_center, y_center, 0, 0)
+x_pix_mapa, y_pix_mapa, _ = wcs_mapa.all_world2pix(ra_center, dec_center, 0, 0)
+
+x_pix_mapa, y_pix_mapa = int(np.round(x_pix_mapa)), int(np.round(y_pix_mapa))
+
+start_x_mapa = max(0, x_pix_mapa - dim_x // 2)
+end_x_mapa = min(mapa_tex_data.shape[1], start_x_mapa + dim_x)
+start_y_mapa = max(0, y_pix_mapa - dim_y // 2)
+end_y_mapa = min(mapa_tex_data.shape[0], start_y_mapa + dim_y)
+
+cubo_spatial_width = end_x_mapa - start_x_mapa
+cubo_spatial_height = end_y_mapa - start_y_mapa
+
+cubo_crop = cubo_procesado[0:cubo_spatial_height, 0:cubo_spatial_width, :]
+tex_crop = mapa_tex_data[start_y_mapa:end_y_mapa, start_x_mapa:end_x_mapa]
+N13CO_crop_true = mapa_nc_hdu[start_y_mapa:end_y_mapa, start_x_mapa:end_x_mapa] 
+
+if not (tex_crop.shape == N13CO_crop_true.shape == cubo_crop.shape[:2]):
+    raise ValueError(f"Dimensiones espaciales de los datos recortados NO COINCIDEN."
+                     f" Tex shape: {tex_crop.shape}, N13CO shape: {N13CO_crop_true.shape}, Cubo spatial shape: {cubo_crop.shape[:2]}")
+
+print(f"Dimensiones del cubo recortado: {cubo_crop.shape}") 
+print(f"Dimensiones del mapa Tex recortado: {tex_crop.shape}") 
+print(f"Dimensiones del mapa N13CO recortado: {N13CO_crop_true.shape}") 
+
+# --- 4. Suavizado espectral ---
+window_length, polyorder = 7, 2
+
+if window_length >= dim_z:
+    window_length = max(3, dim_z - 2 if (dim_z - 2) % 2 != 0 else dim_z - 3)
+    polyorder = min(polyorder, window_length - 1)
+    print(f"Advertencia: 'window_length' ajustado a {window_length} y 'polyorder' a {polyorder} debido a las dimensiones del espectro.")
+
+cubo_suavizado = np.zeros_like(cubo_crop)
+for i in range(cubo_crop.shape[0]):
+    for j in range(cubo_crop.shape[1]):
+        espectro = cubo_crop[i, j, :]
+        espectro_para_procesar = np.nan_to_num(espectro, nan=0.0)
+        espectro_para_procesar[espectro_para_procesar < 0] = 0.0
+
+        if not np.all(espectro_para_procesar == 0.0):
+            cubo_suavizado[i, j, :] = savgol_filter(espectro_para_procesar, window_length, polyorder)
+        else:
+            cubo_suavizado[i, j, :] = espectro
+
+# --- 5. Preparar datos para el modelo (solo espectro suavizado y temperatura) ---
+X_cubo_flat = cubo_suavizado.reshape(-1, cubo_suavizado.shape[2])
+X_tex_flat = tex_crop.reshape(-1, 1)
+
+X_total = np.hstack((X_cubo_flat, X_tex_flat))
+y_total = N13CO_crop_true.reshape(-1)
+
+# --- 6. Filtrar NaN y valores no positivos ---
+validos_y = ~np.isnan(y_total) & (y_total > 0)
+validos_X = ~np.isnan(X_total).any(axis=1)
+validos = validos_y & validos_X
+
+X = X_total[validos] 
+y = y_total[validos] 
+
+print(f"Píxeles antes del filtrado: {len(y_total)}") 
+print(f"Píxeles después del filtrado: {len(y)}") 
+
+# --- 7. Escalar datos ---
+scaler_X_dummy = StandardScaler()
+scaler_y_dummy = StandardScaler()
+
+X_scaled = scaler_X_dummy.fit_transform(X) 
+y_scaled = scaler_y_dummy.fit_transform(y.reshape(-1, 1)).flatten() 
+
+# --- 8. División de datos (Entrenamiento, Prueba, Validación) ---
+X_train, X_temp, y_train, y_temp = train_test_split(X_scaled, y_scaled, test_size=0.3, random_state=42)
+X_test, X_val, y_test, y_val = train_test_split(X_temp, y_temp, test_size=0.5, random_state=42)
+
+print(f"\nDimensiones finales de los conjuntos:")
+print(f"X_train: {X_train.shape}, y_train: {y_train.shape}")
+print(f"X_test: {X_test.shape}, y_test: {y_test.shape}") 
+print(f"X_val: {X_val.shape}, y_val: {y_val.shape}")      
+
+print("\nDatos preprocesados y divididos correctamente.")
+
+# --- INICIO DE LA GENERACIÓN DE GRÁFICOS ---
+
+# --- Cargar Modelos y Escaladores (los que guardaste) ---
+
+# Para Random Forest
+print("\nCargando modelo Random Forest y escaladores...")
+try:
+    best_rf_model = joblib.load('best_random_forest_model.pkl')
+    scaler_X_rf = joblib.load('scaler_X.pkl') 
+    scaler_y_rf = joblib.load('scaler_y.pkl') 
+    print("Modelo RF y escaladores cargados.")
+except FileNotFoundError as e:
+    print(f"Error cargando archivos de Random Forest: {e}")
+    print("Asegúrate de que 'best_random_forest_model.pkl', 'scaler_X.pkl', 'scaler_y.pkl' estén en la misma carpeta.")
+    exit()
+
+# Para MLP
+print("Cargando modelo MLP y escaladores...")
+try:
+    best_mlp_model = tf.keras.models.load_model('best_mlp1_model.keras')
+    scaler_X_mlp = joblib.load('scaler_X_mlp.pkl') 
+    scaler_y_mlp = joblib.load('scaler_y_mlp.pkl') 
+    print("Modelo MLP y escaladores cargados.")
+except FileNotFoundError as e:
+    print(f"Error cargando archivos de MLP: {e}")
+    print("Asegúrate de que 'best_mlp1_model.keras', 'scaler_X_mlp.pkl', 'scaler_y_mlp.pkl' estén en la misma carpeta.")
+    exit()
+
+# --- Realizar Predicciones para los gráficos ---
+
+# Predicciones para Random Forest (usando el X_test generado por la división original)
+y_true_rf_test = scaler_y_rf.inverse_transform(y_test.reshape(-1, 1)).flatten()
+y_pred_rf_test_scaled = best_rf_model.predict(X_test)
+y_pred_rf_test = scaler_y_rf.inverse_transform(y_pred_rf_test_scaled.reshape(-1, 1)).flatten()
+
+
+# Predicciones para MLP (usando X_test e y_test para una comparación justa)
+y_true_mlp_test = scaler_y_mlp.inverse_transform(y_test.reshape(-1, 1)).flatten()
+y_pred_mlp_test_scaled = best_mlp_model.predict(X_test)
+y_pred_mlp_test = scaler_y_mlp.inverse_transform(y_pred_mlp_test_scaled).flatten()
+
+print("\nPredicciones realizadas exitosamente para ambos modelos.")
+
+# --- Métricas de Rendimiento ---
+# Random Forest (Test)
+r2_rf_test = 0.6750 
+mse_rf_test = 0.3023 
+
+# MLP (Test)
+r2_mlp_test = 0.5504
+mse_mlp_test = 0.4183
+
+
+# --- Crear la figura con dos subplots ---
+fig, axes = plt.subplots(1, 2, figsize=(14, 7))
+plt.subplots_adjust(wspace=0.3)
+
+# Determinar los límites de los ejes para que sean consistentes en ambos gráficos
+all_y_values = np.concatenate([y_true_rf_test, y_pred_rf_test, y_true_mlp_test, y_pred_mlp_test])
+min_val = np.nanpercentile(all_y_values, 1)
+max_val = np.nanpercentile(all_y_values, 99)
+
+if min_val == max_val:
+    min_val -= 1e16
+    max_val += 1e16
+else:
+    margin = (max_val - min_val) * 0.1
+    min_val -= margin
+    max_val += margin
+
+min_val = np.floor(min_val / 1e16) * 1e16
+max_val = np.ceil(max_val / 1e16) * 1e16
+
+
+# --- GRÁFICO PARA RANDOM FOREST ---
+axes[0].scatter(y_true_rf_test, y_pred_rf_test, alpha=0.2, s=5, color='royalblue')
+axes[0].plot([min_val, max_val], [min_val, max_val], 'k--', lw=2) # Línea 1:1 sin etiqueta en la leyenda
+axes[0].set_xlabel('Densidad de Columna Verdadera [cm$^{-2}$]', fontsize=12)
+axes[0].set_ylabel('Densidad de Columna Predicha [cm$^{-2}$]', fontsize=12)
+axes[0].set_title(f'Random Forest (Test)\n$R^2$={r2_rf_test:.4f}, MSE={mse_rf_test:.4f}', fontsize=14)
+axes[0].set_aspect('equal', adjustable='box')
+axes[0].set_xlim(min_val, max_val)
+axes[0].set_ylim(min_val, max_val)
+axes[0].ticklabel_format(style='sci', axis='both', scilimits=(0,0))
+
+
+# --- AÑADIR ETIQUETA (a) USANDO ax.text() ---
+# Las coordenadas (x,y) son en el sistema de coordenadas de los ejes del subplot.
+# (0.5, -0.2) significa 50% del ancho del eje X, y 20% por debajo del eje X.
+axes[0].text(0.5, -0.2, '(a)', ha='center', va='top', transform=axes[0].transAxes, fontsize=14)
+
+
+# --- GRÁFICO PARA MLP ---
+axes[1].scatter(y_true_mlp_test, y_pred_mlp_test, alpha=0.2, s=5, color='firebrick') 
+axes[1].plot([min_val, max_val], [min_val, max_val], 'k--', lw=2) # Línea 1:1 sin etiqueta en la leyenda
+axes[1].set_xlabel('Densidad de Columna Verdadera [cm$^{-2}$]', fontsize=12)
+axes[1].set_ylabel('Densidad de Columna Predicha [cm$^{-2}$]', fontsize=12)
+axes[1].set_title(f'Red Neuronal (MLP) (Test)\n$R^2$={r2_mlp_test:.4f}, MSE={mse_mlp_test:.4f}', fontsize=14) 
+axes[1].set_aspect('equal', adjustable='box')
+axes[1].set_xlim(min_val, max_val)
+axes[1].set_ylim(min_val, max_val)
+axes[1].ticklabel_format(style='sci', axis='both', scilimits=(0,0))
+
+
+# --- AÑADIR ETIQUETA (b) USANDO ax.text() ---
+axes[1].text(0.5, -0.2, '(b)', ha='center', va='top', transform=axes[1].transAxes, fontsize=14)
+
+fig.suptitle('Comparación de Predicciones de Densidad de Columna ($\\rm N(^{13}CO)$)', fontsize=16, y=1.05)
+
+plt.tight_layout(rect=[0, 0.05, 1, 0.98]) # Ajusta rect para dejar más espacio en la parte inferior si es necesario
+
+# --- GUARDAR LA FIGURA EN PDF ---
+# Definir el nombre del archivo PDF
+pdf_filename = "comparacion_predicciones_modelos.pdf"
+# Guardar la figura actual en PDF
+plt.savefig(pdf_filename, format='pdf', bbox_inches='tight')
+
+print(f"\nLa imagen ha sido guardada en '{pdf_filename}'")
+
+plt.show() # Muestra la ventana con los gráficos (opcional)
