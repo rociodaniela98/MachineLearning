@@ -1,0 +1,219 @@
+import numpy as np
+import joblib
+import tensorflow as tf # Importar TensorFlow como tf para acceder a Keras
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import r2_score, mean_squared_error
+from astropy.io import fits
+from astropy.wcs import WCS
+import warnings
+from astropy.wcs import FITSFixedWarning
+from scipy.signal import savgol_filter
+import matplotlib.pyplot as plt
+
+# Silenciar warnings de WCS
+warnings.simplefilter('ignore', category=FITSFixedWarning)
+
+# --- 1. Cargar datos ---
+cubo_hdu = fits.open("13co32cubo.fits")[0]
+mapa_tex_data = fits.open("mapaTex.fits")[0].data
+mapa_nc_hdu = fits.open("mapaN13.fits")[0].data
+
+# --- 2. Inicializar WCS y Dimensiones ---
+wcs_cubo = WCS(cubo_hdu.header)
+wcs_mapa = WCS(fits.open("mapaN13.fits")[0].header)
+
+dim_z, dim_y, dim_x = cubo_hdu.data.shape
+cubo_procesado = np.transpose(cubo_hdu.data, (1, 2, 0))
+
+# --- 3. Recorte central y sincronización ---
+x_center, y_center = dim_x // 2, dim_y // 2
+ra_center, dec_center, _ = wcs_cubo.all_pix2world(x_center, y_center, 0, 0)
+x_pix_mapa, y_pix_mapa, _ = wcs_mapa.all_world2pix(ra_center, dec_center, 0, 0)
+
+x_pix_mapa, y_pix_mapa = int(np.round(x_pix_mapa)), int(np.round(y_pix_mapa))
+
+start_x_mapa = max(0, x_pix_mapa - dim_x // 2)
+end_x_mapa = min(mapa_tex_data.shape[1], start_x_mapa + dim_x)
+start_y_mapa = max(0, y_pix_mapa - dim_y // 2)
+end_y_mapa = min(mapa_tex_data.shape[0], start_y_mapa + dim_y)
+
+cubo_spatial_width = end_x_mapa - start_x_mapa
+cubo_spatial_height = end_y_mapa - start_y_mapa
+
+cubo_crop = cubo_procesado[0:cubo_spatial_height, 0:cubo_spatial_width, :]
+tex_crop = mapa_tex_data[start_y_mapa:end_y_mapa, start_x_mapa:end_x_mapa]
+N13CO_crop_true = mapa_nc_hdu[start_y_mapa:end_y_mapa, start_x_mapa:end_x_mapa]
+
+if not (tex_crop.shape == N13CO_crop_true.shape == cubo_crop.shape[:2]):
+    raise ValueError(f"Dimensiones espaciales de los datos recortados NO COINCIDEN."
+                     f" Tex shape: {tex_crop.shape}, N13CO shape: {N13CO_crop_true.shape}, Cubo spatial shape: {cubo_crop.shape[:2]}")
+
+print(f"Dimensiones del cubo recortado: {cubo_crop.shape}")
+print(f"Dimensiones del mapa Tex recortado: {tex_crop.shape}")
+print(f"Dimensiones del mapa N13CO recortado: {N13CO_crop_true.shape}")
+
+# --- 4. Suavizado espectral ---
+window_length, polyorder = 7, 2
+
+if window_length >= dim_z:
+    window_length = max(3, dim_z - 2 if (dim_z - 2) % 2 != 0 else dim_z - 3)
+    polyorder = min(polyorder, window_length - 1)
+    print(f"Advertencia: 'window_length' ajustado a {window_length} y 'polyorder' a {polyorder} debido a las dimensiones del espectro.")
+
+cubo_suavizado = np.zeros_like(cubo_crop)
+for i in range(cubo_crop.shape[0]):
+    for j in range(cubo_crop.shape[1]):
+        espectro = cubo_crop[i, j, :]
+        espectro_para_procesar = np.nan_to_num(espectro, nan=0.0)
+        espectro_para_procesar[espectro_para_procesar < 0] = 0.0
+
+        if not np.all(espectro_para_procesar == 0.0):
+            cubo_suavizado[i, j, :] = savgol_filter(espectro_para_procesar, window_length, polyorder)
+        else:
+            cubo_suavizado[i, j, :] = espectro
+
+# --- 5. Preparar datos para el modelo (solo espectro suavizado y temperatura) ---
+X_cubo_flat = cubo_suavizado.reshape(-1, cubo_suavizado.shape[2])
+X_tex_flat = tex_crop.reshape(-1, 1)
+
+X_total = np.hstack((X_cubo_flat, X_tex_flat))
+y_total = N13CO_crop_true.reshape(-1)
+
+# --- 6. Filtrar NaN y valores no positivos ---
+validos_y = ~np.isnan(y_total) & (y_total > 0)
+validos_X = ~np.isnan(X_total).any(axis=1)
+validos = validos_y & validos_X
+
+X = X_total[validos]
+y = y_total[validos]
+
+print(f"Píxeles antes del filtrado: {len(y_total)}")
+print(f"Píxeles después del filtrado: {len(y)}")
+
+# --- 7. Escalar datos ---
+scaler_X = StandardScaler()
+scaler_y = StandardScaler()
+X_scaled = scaler_X.fit_transform(X)
+y_scaled = scaler_y.fit_transform(y.reshape(-1, 1)).flatten()
+
+# --- 8. División de datos (Entrenamiento, Prueba, Validación) ---
+X_train, X_temp, y_train, y_temp = train_test_split(X_scaled, y_scaled, test_size=0.3, random_state=42)
+X_test, X_val, y_test, y_val = train_test_split(X_temp, y_temp, test_size=0.5, random_state=42)
+
+# --- 9. Construcción y Entrenamiento del modelo MLP ---
+# Función para evaluar el modelo e imprimir métricas (se mantuvo para compatibilidad)
+def evaluar(y_true, y_pred, dataset="Conjunto"):
+    r2 = r2_score(y_true, y_pred)
+    mse = mean_squared_error(y_true, y_pred)
+    print(f"{dataset}: R²={r2:.4f}, MSE={mse:.4f}")
+
+# Define el factor de regularización L2. Un valor común para empezar es 0.001 o 0.0001.
+# Puedes ajustar este valor si el sobreajuste persiste (subirlo) o si el modelo se subajusta (bajarlo).
+l2_reg_factor = 0.005
+
+model = tf.keras.models.Sequential([
+    # --- CORRECCIÓN ADVERTENCIA 1: Usar tf.keras.Input como primera capa ---
+    tf.keras.Input(shape=(X_train.shape[1],)), # Define la forma de entrada explícitamente
+
+    # Capa densa con regularización L2 para combatir el sobreajuste
+    tf.keras.layers.Dense(256, activation='relu', kernel_regularizer=tf.keras.regularizers.l2(l2_reg_factor)),
+    tf.keras.layers.Dropout(0.5), # Dropout para regularización
+
+    tf.keras.layers.Dense(128, activation='relu', kernel_regularizer=tf.keras.regularizers.l2(l2_reg_factor)),
+    tf.keras.layers.Dropout(0.5),
+
+    tf.keras.layers.Dense(64, activation='relu', kernel_regularizer=tf.keras.regularizers.l2(l2_reg_factor)),
+    tf.keras.layers.Dropout(0.2), # Puedes añadir más dropout si el sobreajuste es muy persistente
+
+    # Capa de salida: una neurona para la regresión (predicción de densidad de columna)
+    tf.keras.layers.Dense(1)
+])
+# Compilar el modelo
+model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+              loss='mse',
+              metrics=[tf.keras.metrics.MeanAbsoluteError(name='mae'), tf.keras.metrics.R2Score(name='r2_score')])
+
+# Callbacks para un entrenamiento más eficiente y robusto
+early_stopping = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=20, restore_best_weights=True)
+reduce_lr = tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=10, min_lr=0.00001)
+
+print("Entrenando modelo MLP con regularización L2...")
+history = model.fit(
+    X_train, y_train,
+    epochs=200, # Número máximo de épocas. EarlyStopping lo detendrá antes si converge.
+    batch_size=32, # Número de muestras por actualización de gradiente
+    validation_data=(X_val, y_val), # Datos de validación para monitorear el rendimiento
+    callbacks=[early_stopping, reduce_lr], # Usar los callbacks definidos
+    verbose=1 # Mostrar progreso detallado
+)
+
+# --- 10. Evaluar el modelo ---
+loss, mae, r2_keras = model.evaluate(X_test, y_test, verbose=0)
+print(f"Test: Loss (MSE)={loss:.4f}, MAE={mae:.4f}, R² (Keras)={r2_keras:.4f}")
+
+# Para obtener el R² de Scikit-learn en entrenamiento y validación (útil para comparar con Random Forest)
+y_pred_train = model.predict(X_train).flatten()
+y_pred_val = model.predict(X_val).flatten()
+
+evaluar(y_train, y_pred_train, "Entrenamiento (MLP) (R² scikit-learn)")
+evaluar(y_val, y_pred_val, "Validación (MLP) (R² scikit-learn)")
+# --- Si quieres el R² de Scikit-learn para el Test set del MLP, puedes añadirlo aquí ---
+y_pred_test = model.predict(X_test).flatten()
+r2_mlp_test_sklearn = r2_score(y_test, y_pred_test)
+mse_mlp_test_sklearn = mean_squared_error(y_test, y_pred_test)
+print(f"Test (MLP) (R² scikit-learn): R²={r2_mlp_test_sklearn:.4f}, MSE={mse_mlp_test_sklearn:.4f}")
+
+# --- 11. Predicción completa y reconstrucción del mapa ---
+X_cubo_flat_full = cubo_suavizado.reshape(-1, cubo_suavizado.shape[2])
+X_tex_flat_full = tex_crop.reshape(-1, 1)
+X_full_predict_raw = np.hstack((X_cubo_flat_full, X_tex_flat_full))
+
+X_for_prediction = X_full_predict_raw[validos]
+X_for_prediction_scaled = scaler_X.transform(X_for_prediction)
+
+y_pred_full_scaled = model.predict(X_for_prediction_scaled).flatten()
+y_pred_full = scaler_y.inverse_transform(y_pred_full_scaled.reshape(-1, 1)).flatten()
+
+mapa_predicho_flat = np.full(y_total.shape, 0.0)
+mapa_predicho_flat[validos] = y_pred_full
+mapa_predicho_2d = mapa_predicho_flat.reshape(N13CO_crop_true.shape)
+
+residuos = N13CO_crop_true - mapa_predicho_2d
+
+# --- 12. Graficar mapas ---
+vmin = 0.0
+vmax = np.nanmax([N13CO_crop_true, mapa_predicho_2d])
+vmax_res = np.nanmax(np.abs(residuos[~np.isnan(residuos)]))
+
+fig, axes = plt.subplots(1, 3, figsize=(20, 7))
+
+N13CO_crop_true_for_plot = np.nan_to_num(N13CO_crop_true, nan=0.0)
+im1 = axes[0].imshow(N13CO_crop_true_for_plot, origin='lower', cmap='viridis', vmin=vmin, vmax=vmax)
+axes[0].set_title('Densidad de Columna Real (NaNs como 0)')
+plt.colorbar(im1, ax=axes[0], fraction=0.046, pad=0.04)
+
+im2 = axes[1].imshow(mapa_predicho_2d, origin='lower', cmap='viridis', vmin=vmin, vmax=vmax)
+axes[1].set_title('Densidad de Columna Predicha (MLP)')
+plt.colorbar(im2, ax=axes[1], fraction=0.046, pad=0.04)
+
+residuos_for_plot = np.nan_to_num(residuos, nan=0.0)
+im3 = axes[2].imshow(residuos_for_plot, origin='lower', cmap='coolwarm', vmin=-vmax_res, vmax=vmax_res)
+axes[2].set_title('Residuos (Real - Predicho) (MLP)')
+plt.colorbar(im3, ax=axes[2], fraction=0.046, pad=0.04)
+
+plt.tight_layout()
+plt.show()
+
+# --- Opcional: Guardar el modelo entrenado ---
+# --- CORRECCIÓN ADVERTENCIA 2: Guardar en formato .keras ---
+model.save('best_mlp1_model.keras') # Guarda el modelo completo en el nuevo formato nativo de Keras
+joblib.dump(scaler_X, 'scaler_X_mlp.pkl')
+joblib.dump(scaler_y, 'scaler_y_mlp.pkl')
+print("Modelo MLP y escaladores guardados.")
+
+# --- Opcional: Guardar el mapa predicho en un archivo FITS ---
+new_hdu = fits.PrimaryHDU(data=mapa_predicho_2d)
+new_hdu.header = fits.open("mapaN13.fits")[0].header # Copiar cabecera del mapa original
+new_hdu.writeto("mapa_N13CO_predicho1_mlp.fits", overwrite=True)
+print("Mapa de densidad de columna predicho por MLP guardado como mapa_N13CO_predicho_mlp.fits")
